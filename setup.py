@@ -80,6 +80,7 @@ extras["tf-cpu"] = [
     "keras2onnx @ git+git://github.com/onnx/keras-onnx.git@cbdc75cb950b16db7f0a67be96a278f8d2953b48#egg=keras2onnx"
 ]
 extras["torch"] = ["torch"]
+extras["flax"] = ["flax"]
 
 extras["serving"] = ["pydantic", "uvicorn", "fastapi", "starlette"]
 extras["all"] = extras["serving"] + ["tensorflow", "torch"]
