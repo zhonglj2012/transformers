@@ -278,6 +278,7 @@ if is_torch_available():
         XLMForTokenClassification,
         XLMForQuestionAnswering,
         XLMForQuestionAnsweringSimple,
+        XLMForMultipleChoice,
         XLM_PRETRAINED_MODEL_ARCHIVE_LIST,
     )
     from .modeling_bart import (
@@ -355,6 +356,8 @@ if is_torch_available():
         FlaubertForSequenceClassification,
         FlaubertForQuestionAnswering,
         FlaubertForQuestionAnsweringSimple,
+        FlaubertForTokenClassification,
+        FlaubertForMultipleChoice,
         FLAUBERT_PRETRAINED_MODEL_ARCHIVE_LIST,
     )
 
