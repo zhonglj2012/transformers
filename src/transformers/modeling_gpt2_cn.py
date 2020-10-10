@@ -225,33 +225,25 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
+    """ an unassuming Transformer block """
+
     def __init__(self, n_ctx, config, scale=False):
         super().__init__()
         nx = config.n_embd
         self.ln_1 = nn.LayerNorm(nx, eps=config.layer_norm_epsilon)
-        self.attn = Attention(nx, n_ctx, config, scale)
         self.ln_2 = nn.LayerNorm(nx, eps=config.layer_norm_epsilon)
-        self.mlp = MLP(4 * nx, config)
-
-    def forward(
-        self, x, layer_past=None, attention_mask=None, head_mask=None, use_cache=False, output_attentions=False,
-    ):
-        output_attn = self.attn(
-            self.ln_1(x),
-            layer_past=layer_past,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
+        self.attn = Attention(nx, n_ctx, config, scale)
+        self.mlp = nn.Sequential(
+            nn.Linear(config.n_embd, 4 * config.n_embd),
+            nn.GELU(),
+            nn.Linear(4 * config.n_embd, config.n_embd),
+            nn.Dropout(config.resid_pdrop),
         )
-        a = output_attn[0]  # output_attn: a, present, (attentions)
 
-        x = x + a
-        m = self.mlp(self.ln_2(x))
-        x = x + m
-
-        outputs = [x] + output_attn[1:]
-        return outputs  # x, present, (attentions)
+    def forward(self, x):
+        x = x + self.attn(x)
+        x = self.ln_2(x + self.mlp(self.ln_1(x)))
+        return x
 
 
 class GPT2PreTrainedModel(PreTrainedModel):
