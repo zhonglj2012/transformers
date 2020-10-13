@@ -22,17 +22,15 @@ import warnings
 
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from torch.nn import CrossEntropyLoss
 
 from .activations import ACT2FN
 from .configuration_gpt2 import GPT2Config
 from .file_utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_callable
 from .modeling_utils import (
-    Conv1D,
     PreTrainedModel,
     SequenceSummary,
-    find_pruneable_heads_and_indices,
-    prune_conv1d_layer,
 )
 
 
@@ -120,108 +118,39 @@ class Attention(nn.Module):
         self.split_size = n_state
         self.scale = scale
 
-        self.c_attn = Conv1D(n_state * 3, nx)
-        self.c_proj = Conv1D(n_state, nx)
-        self.attn_dropout = nn.Dropout(config.attn_pdrop)
-        self.resid_dropout = nn.Dropout(config.resid_pdrop)
-        self.pruned_heads = set()
-
-    def prune_heads(self, heads):
-        if len(heads) == 0:
-            return
-        heads, index = find_pruneable_heads_and_indices(
-            heads, self.n_head, self.split_size // self.n_head, self.pruned_heads
-        )
-        index_attn = torch.cat([index, index + self.split_size, index + (2 * self.split_size)])
-
-        # Prune conv1d layers
-        self.c_attn = prune_conv1d_layer(self.c_attn, index_attn, dim=1)
-        self.c_proj = prune_conv1d_layer(self.c_proj, index, dim=0)
-
-        # Update hyper params
-        self.split_size = (self.split_size // self.n_head) * (self.n_head - len(heads))
-        self.n_head = self.n_head - len(heads)
-        self.pruned_heads = self.pruned_heads.union(heads)
-
-    def _attn(self, q, k, v, attention_mask=None, head_mask=None, output_attentions=False):
-        w = torch.matmul(q, k)
-        if self.scale:
-            w = w / (float(v.size(-1)) ** 0.5)
-        nd, ns = w.size(-2), w.size(-1)
-        mask = self.bias[:, :, ns - nd : ns, :ns]
-        w = torch.where(mask.bool(), w, self.masked_bias.to(w.dtype))
-
-        if attention_mask is not None:
-            # Apply the attention mask
-            w = w + attention_mask
-
-        w = nn.Softmax(dim=-1)(w)
-        w = self.attn_dropout(w)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            w = w * head_mask
-
-        outputs = [torch.matmul(w, v)]
-        if output_attentions:
-            outputs.append(w)
-        return outputs
-
-    def merge_heads(self, x):
-        x = x.permute(0, 2, 1, 3).contiguous()
-        new_x_shape = x.size()[:-2] + (x.size(-2) * x.size(-1),)
-        return x.view(*new_x_shape)  # in Tensorflow implem: fct merge_states
-
-    def split_heads(self, x, k=False):
-        new_x_shape = x.size()[:-1] + (self.n_head, x.size(-1) // self.n_head)
-        x = x.view(*new_x_shape)  # in Tensorflow implem: fct split_states
-        if k:
-            return x.permute(0, 2, 3, 1)  # (batch, head, head_features, seq_length)
-        else:
-            return x.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+        self.key = nn.Linear(n_state, n_state)
+        self.query = nn.Linear(n_state, n_state)
+        self.value = nn.Linear(n_state, n_state)
+        self.c_proj = nn.Linear(n_state, n_state)
+        self.attn_drop = nn.Dropout(config.attn_pdrop)
+        self.resid_drop = nn.Dropout(config.resid_pdrop)
+        self.register_buffer("mask", torch.tril(torch.ones(config.n_positions, config.n_positions))
+                             .view(1, 1, config.n_positions, config.n_positions))
+        self.n_head = config.n_head
+        
 
     def forward(
         self, x, layer_past=None, attention_mask=None, head_mask=None, use_cache=False, output_attentions=False
     ):
-        x = self.c_attn(x)
-        query, key, value = x.split(self.split_size, dim=2)
-        query = self.split_heads(query)
-        key = self.split_heads(key, k=True)
-        value = self.split_heads(value)
-        if layer_past is not None:
-            past_key, past_value = layer_past[0].transpose(-2, -1), layer_past[1]  # transpose back cf below
-            key = torch.cat((past_key, key), dim=-1)
-            value = torch.cat((past_value, value), dim=-2)
+        B, T, C = x.size()
 
-        if use_cache is True:
-            present = torch.stack((key.transpose(-2, -1), value))  # transpose to have same shapes for stacking
-        else:
-            present = (None,)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        attn_outputs = self._attn(query, key, value, attention_mask, head_mask, output_attentions)
-        a = attn_outputs[0]
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_drop(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
-        a = self.merge_heads(a)
-        a = self.c_proj(a)
-        a = self.resid_dropout(a)
+        # output projection
+        y = self.resid_drop(self.proj(y))
+        return y
 
-        outputs = [a, present] + attn_outputs[1:]
-        return outputs  # a, present, (attentions)
-
-
-class MLP(nn.Module):
-    def __init__(self, n_state, config):  # in MLP: n_state=3072 (4 * n_embd)
-        super().__init__()
-        nx = config.n_embd
-        self.c_fc = Conv1D(n_state, nx)
-        self.c_proj = Conv1D(nx, n_state)
-        self.act = ACT2FN[config.activation_function]
-        self.dropout = nn.Dropout(config.resid_pdrop)
-
-    def forward(self, x):
-        h = self.act(self.c_fc(x))
-        h2 = self.c_proj(h)
-        return self.dropout(h2)
 
 
 class Block(nn.Module):
@@ -261,11 +190,11 @@ class GPT2PreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """ Initialize the weights.
         """
-        if isinstance(module, (nn.Linear, nn.Embedding, Conv1D)):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if isinstance(module, (nn.Linear, Conv1D)) and module.bias is not None:
+            if isinstance(module, (nn.Linear)) and module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
@@ -355,13 +284,6 @@ class GPT2Model(GPT2PreTrainedModel):
 
     def set_input_embeddings(self, new_embeddings):
         self.wte = new_embeddings
-
-    def _prune_heads(self, heads_to_prune):
-        """ Prunes heads of the model.
-            heads_to_prune: dict of {layer_num: list of heads to prune in this layer}
-        """
-        for layer, heads in heads_to_prune.items():
-            self.h[layer].attn.prune_heads(heads)
 
     @add_start_docstrings_to_callable(GPT2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(tokenizer_class=_TOKENIZER_FOR_DOC, checkpoint="gpt2")
@@ -492,7 +414,6 @@ class GPT2Model(GPT2PreTrainedModel):
 
             if output_attentions:
                 all_attentions.append(outputs[2])
-
 
         hidden_states = hidden_states.view(*output_shape)
         # Add last hidden state
