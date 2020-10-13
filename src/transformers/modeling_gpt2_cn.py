@@ -338,7 +338,7 @@ GPT2_INPUTS_DOCSTRING = r"""
     "The bare GPT2 Model transformer outputting raw hidden-states without any specific head on top.",
     GPT2_START_DOCSTRING,
 )
-class GPT2Model(GPT2PreTrainedModel):
+class GPT2CNModel(GPT2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
