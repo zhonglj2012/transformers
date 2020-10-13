@@ -225,33 +225,25 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
+    """ an unassuming Transformer block """
+
     def __init__(self, n_ctx, config, scale=False):
         super().__init__()
         nx = config.n_embd
         self.ln_1 = nn.LayerNorm(nx, eps=config.layer_norm_epsilon)
-        self.attn = Attention(nx, n_ctx, config, scale)
         self.ln_2 = nn.LayerNorm(nx, eps=config.layer_norm_epsilon)
-        self.mlp = MLP(4 * nx, config)
-
-    def forward(
-        self, x, layer_past=None, attention_mask=None, head_mask=None, use_cache=False, output_attentions=False,
-    ):
-        output_attn = self.attn(
-            self.ln_1(x),
-            layer_past=layer_past,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
+        self.attn = Attention(nx, n_ctx, config, scale)
+        self.mlp = nn.Sequential(
+            nn.Linear(config.n_embd, 4 * config.n_embd),
+            nn.GELU(),
+            nn.Linear(4 * config.n_embd, config.n_embd),
+            nn.Dropout(config.resid_pdrop),
         )
-        a = output_attn[0]  # output_attn: a, present, (attentions)
 
-        x = x + a
-        m = self.mlp(self.ln_2(x))
-        x = x + m
-
-        outputs = [x] + output_attn[1:]
-        return outputs  # x, present, (attentions)
+    def forward(self, x):
+        x = x + self.attn(x)
+        x = self.ln_2(x + self.mlp(self.ln_1(x)))
+        return x
 
 
 class GPT2PreTrainedModel(PreTrainedModel):
@@ -352,7 +344,7 @@ class GPT2Model(GPT2PreTrainedModel):
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.wpe = nn.Embedding(config.n_positions, config.n_embd)
-        self.drop = nn.Dropout(config.embd_pdrop)
+        # self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([Block(config.n_ctx, config, scale=True) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
 
@@ -473,7 +465,8 @@ class GPT2Model(GPT2PreTrainedModel):
         else:
             token_type_embeds = 0
         hidden_states = inputs_embeds + position_embeds + token_type_embeds
-        hidden_states = self.drop(hidden_states)
+        hidden_states = self.ln_f(hidden_states)
+        # hidden_states = self.drop(hidden_states)
 
         output_shape = input_shape + (hidden_states.size(-1),)
 
@@ -500,7 +493,6 @@ class GPT2Model(GPT2PreTrainedModel):
             if output_attentions:
                 all_attentions.append(outputs[2])
 
-        hidden_states = self.ln_f(hidden_states)
 
         hidden_states = hidden_states.view(*output_shape)
         # Add last hidden state
